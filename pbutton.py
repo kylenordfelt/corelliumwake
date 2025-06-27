@@ -5,6 +5,7 @@
 ## must be run as root or via sudo
 
 # imports
+
 from gpiozero import Button
 from os import system
 from time import sleep
@@ -20,6 +21,7 @@ def btn_held():
     system("poweroff")
 
 # do stuff
+
 if __name__ == '__main__':
     pbutton = Button(pin=PIN,
                      pull_up=PULL_UP,

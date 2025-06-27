@@ -17,12 +17,48 @@ import pwd
 import select
 import socket
 import io
-import struct
+import structs
 import subprocess
 import sys
 import time
 import threading
 
+from gpiozero import OutputDevice
+
+class JetsonDevice:
+    def _init_(self, name, reset_gpio):
+        self.name = name
+        self.reset_gpio = reset_gpio
+
+        self.reset_control = OutputDevice(reset_gpio, active_high=True, intital_value =False)
+    def reset(self):
+        try:
+            print("resetting {self.name}...")
+            self.reset_control.on()
+
+            time.sleep(0.5)
+
+            self.reset_control.off()
+            print(f"{self.name} reset completed")
+            return True
+        
+        except Exception as e:
+            print(f"Error resetting {self.name}: {e}")
+            return False
+        
+    def get_status(self):
+        """Return basic device status"""
+        return {
+            'name': self.name,
+            'reset_gpio': self.reset_gpio,
+            'reset_active': self.reset_control.is_active,
+            'status': 'ready'
+        }
+    
+    def cleanup(self):
+        """Clean up GPIO resources"""
+        if hasattr(self, 'reset_control'):
+            self.reset_control.close()
 
 # function definitiona start here
 
@@ -108,17 +144,7 @@ def _daemonize_me():
     os.dup2(0, 1) # stdout
     os.dup2(0, 2) # stderr
 
-def pack_mac(split_mac_address):
-    # given a split MAC address return it packed for sending/receiving
 
-    packed = struct.pack(b'!BBBBBB',
-                         int(split_mac_address[0], 16),
-                         int(split_mac_address[1], 16),
-                         int(split_mac_address[2], 16),
-                         int(split_mac_address[3], 16),
-                         int(split_mac_address[4], 16),
-                         int(split_mac_address[5], 16))
-    return packed
 
 def press_button(button, duration):
     # button is a gpiozero digital output object
@@ -166,131 +192,7 @@ def pinger(targets, interval):
     for p in pingthings:
         pingthings[p].close()
     logging.debug('Exiting')
-
-def make_packet(mac_address):
-    # given a mac address return a wol magic packet
-
-    wol_header = b'\xff' * 6
-    parts = mac_address.split(':')
-
-    if len(parts) != 6:
-        return None
-
-    return wol_header + pack_mac(parts) * 16
-    
-def wol_listener():
-    # wake on lan listerner(s)
-    # this is about as basic as it can get
-    # not fully compliant with WOL spec as packets will only been seen when sent as UDP to a know port
-    # (usually 7 and/or 9)
-    # this will not wake a PC from sleep if the PSU remains fully on
-    # true WOL requires examining every ethernet frame received by the network interface
-
-    global WOL_ENABLED, WOL_SECUREON, privs_droppable
-
-    # create magic packets
-    logging.debug('Creating magic packets')
-    magic_packets = {}
-    magic_packets['wake'] = make_packet(WOL_WAKE_MAC_ADDRESS)
-    magic_packets['shutdown'] = make_packet(WOL_SHUTDOWN_MAC_ADDRESS)
-    magic_packets['reset'] = make_packet(WOL_RESET_MAC_ADDRESS)
-    magic_packets['forceoff'] = make_packet(WOL_FORCEOFF_MAC_ADDRESS)
-    magic_packets['aux1'] = make_packet(WOL_AUX1_MAC_ADDRESS)
-    magic_packets['aux2'] = make_packet(WOL_AUX2_MAC_ADDRESS)
-
-    empty_packet_count = 0
-    for packet in list(magic_packets.values()):
-        if packet is None:
-            empty_packet_count += 1
-    
-    # check we have something to listen for and ports to listen on
-    if (empty_packet_count == len(magic_packets)
-         or len(WOL_PORTS) == 0 ):
-        WOL_ENABLED = False
-        logging.warning('Nothing to listen for. Exiting and disabling WOL listener.')
-        return
-    
-    # create and start listeners
-    logging.debug('Creating listeners')
-    listeners = []
-    for port in WOL_PORTS:
-        try:
-            logging.debug('Trying on port %s' % port)
-            listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            listener.setblocking(0)
-            listener.bind(('', port))
-            listeners.append(listener)
-            logging.debug('Success ')
-        except Exception as e:
-            logging.error('Failed to start WOL listener on port %s %s', port, str(e))
-    if len(listeners) ==  0:
-        logging.error('Failed to start any WOL listeners. Exiting thread and disabling WOL listener.')
-        WOL_ENABLED = False
-        return
-
-    logging.debug('Started %s listener(s)' % len(listeners))
-
-    while stop_threads == False:
-        # now we can actually do some listening
-        r, w, e = select.select(listeners, [], [], 0)
-        for s in r:
-            inc = ''
-            inc, sender = s.recvfrom(1024)
-            logging.debug('data received from %s' % sender[0])
-            logging.debug('\t%s' % inc)
-            # validate host
-            if valid_host(sender[0]) == False:
-                logging.debug('invalid sender. Ignoring packet.')
-                continue
-            for k in magic_packets:
-                logging.debug('Recieved:\n\t%s\nMatching against:\n\t%s' % (inc, magic_packets[k]))
-                if (magic_packets[k] is not None
-                    and magic_packets[k] in inc):
-                    logging.debug('Matched %s' % k)
-                    try:
-                        # it's a magic packet we want to handle
-                        if k in ('wake', 'shutdown', 'forceoff'):
-                            logging.debug('Setting button to POWER_SWITCH')
-                            target_button = POWER_SWITCH
-                        elif k == 'reset':RESET_SWITCH
-                        elif k == 'aux1':
-                            target_button = AUX1
-                        elif k == 'aux2':
-                            target_button = AUX2
-                        else:
-                            # reserved for future use
-                            logging.debug('You should never see this')
-                    except NameError:
-                        logging.exception('No pin configured for function.')
-                        target_button = None
-                    if k == 'forceoff':
-                        target_duration = LONG_PRESS
-                    else:
-                        target_duration = SHORT_PRESS
-                    logging.debug('Press duration set to %s' % target_duration)
-                    go_nogo = False
-                    if (k == 'wake'
-                        and PSU_SENSE.is_active == False):
-                        go_nogo = True
-                    if (k in ('shutdown', 'forceoff', 'reset')
-                        and PSU_SENSE.is_active == True):
-                        go_nogo = True
-                    if k in ('aux1', 'aux2'):
-                        go_nogo = True
-
-                    if go_nogo:
-                        # press button here
-                        press_button(target_button, target_duration)
-                    else:
-                        logging.debug('%s packet ignored due to current PSU state' % k)
-                else:
-                    logging.debug('Recieved data does not match %s packet' % k)
-                break
-        time.sleep(0.1)
-
-    for listener in listeners:
-        listener.close()
-    logging.debug('exiting')
+  
 
 def webserver(host, port):
     # simple web server for control page
@@ -502,16 +404,6 @@ def start_webserver():
         webserver_thread = None
     return webserver_thread
 
-def start_wol():
-##    global privs_droppable
-    if WOL_ENABLED:
-        logging.debug('(re)starting wol listener')
-        wol_thread = threading.Thread(name='wol_listener',
-                                      target=wol_listener)
-        wol_thread.start()
-    else:
-        wol_thread = None
-    return wol_thread
 
 
 ## now we can do something...
@@ -672,30 +564,6 @@ if __name__ == '__main__':
         WEBSERVER_HOST = default_config['host']
         WEBSERVER_PORT = int(default_config['web_port'])
         WEBSERVER_RELOAD_DELAY = default_config['reload_delay']
-    try:
-        WOL_ENABLED = config.getboolean('wol', 'wol_enabled')
-        RAW_WOL_PORTS = config.get('wol', 'wol_ports')
-        WOL_WAKE_MAC_ADDRESS = config.get('wol', 'wake_mac')
-        WOL_SHUTDOWN_MAC_ADDRESS = config.get('wol', 'shutdown_mac')
-        WOL_RESET_MAC_ADDRESS = config.get('wol', 'forceoff_mac')
-        WOL_FORCEOFF_MAC_ADDRESS = config.get('wol', 'reset_mac')
-        WOL_AUX1_MAC_ADDRESS = config.get('wol', 'aux1_mac')
-        WOL_AUX2_MAC_ADDRESS = config.get('wol', 'aux2_mac')
-    except configparser.NoSectionError:
-        logging.debug('No config section "%s" using defaults instead.' % 'wol')
-        WOL_ENABLED = bool(default_config['wol_enabled'])
-        RAW_WOL_PORTS = default_config['wol_ports']
-        WOL_WAKE_MAC_ADDRESS = default_config['wake_mac']
-        WOL_SHUTDOWN_MAC_ADDRESS = default_config['shutdown_mac']
-        WOL_RESET_MAC_ADDRESS = default_config['forceoff_mac']
-        WOL_FORCEOFF_MAC_ADDRESS = default_config['reset_mac']
-        WOL_AUX1_MAC_ADDRESS = default_config['aux1_mac']
-        WOL_AUX1_MAC_ADDRESS = default_config['aux1_mac']
-    # parse RAW_WOL_PORTS
-    WOL_PORTS = []
-    for t in RAW_WOL_PORTS.split(','):
-        t.strip()
-        WOL_PORTS.append(int(t))
     try:
         PINGER_ENABLED = config.getboolean('pinger', 'pinger_enabled')
         TARGET_IDS = config.get('pinger', 'target').strip().split(',')
@@ -864,13 +732,6 @@ if __name__ == '__main__':
                 else:
                     logging.critical('Webserver thread has died. Exiting')
                     break
-            if wol_thread is not None and wol_thread.isAlive() == False:
-                if RESTART_THREADS:
-                    wol_thread = start_wol()
-                else:
-                    logging.critical('WOL listener thread has died. Exiting')
-                    break
-            
             time.sleep(loop_delay)
             
     finally:
