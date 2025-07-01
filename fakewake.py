@@ -1,10 +1,9 @@
-#! /usr/bin/env python3
+#!/usr/bin/env python3
 ##
+## Modified FakeWake - Multiple Device Reset Control
 ## This software is supplied "as is" with no warranties either expressed or implied.
 ##
-## It worked for me but your mileage may vary.
-##
-## For non-comercial use only.
+## For non-commercial use only.
 
 # imports
 import argparse
@@ -17,7 +16,6 @@ import pwd
 import select
 import socket
 import io
-import structs
 import subprocess
 import sys
 import time
@@ -26,22 +24,20 @@ import threading
 from gpiozero import OutputDevice
 
 class JetsonDevice:
-    def _init_(self, name, reset_gpio):
+    def __init__(self, name, reset_gpio):
         self.name = name
         self.reset_gpio = reset_gpio
-
-        self.reset_control = OutputDevice(reset_gpio, active_high=True, intital_value =False)
+        # Fix typo: intital_value -> initial_value
+        self.reset_control = OutputDevice(reset_gpio, active_high=True, initial_value=False)
+    
     def reset(self):
         try:
-            print("resetting {self.name}...")
+            print(f"Resetting {self.name}...")
             self.reset_control.on()
-
             time.sleep(0.5)
-
             self.reset_control.off()
             print(f"{self.name} reset completed")
             return True
-        
         except Exception as e:
             print(f"Error resetting {self.name}: {e}")
             return False
@@ -60,46 +56,32 @@ class JetsonDevice:
         if hasattr(self, 'reset_control'):
             self.reset_control.close()
 
-# function definitiona start here
+# Global variables
+DEVICES = {}  # Dictionary to store device objects
+stop_threads = False
+last_action_time = {}  # Per-device timing
 
 def valid_host(ipaddr):
-    # validate ipaddr against HOST_ALLOW and HOSTS_DENY
-    #
-    # usual unix/linux rules:
-    #    valid if ipaddr in HOSTS_ALLOW
-    #    otherwise invalid if in HOSTS_DENY
-    #    otherwise valid
-    #
-    # empty lists disable access control
-    # a single entry of '*' in HOSTS_DENY blocks all hosts
-    # not listed in HOSTS_ALLOW
-
+    """Validate IP address against HOST_ALLOW and HOSTS_DENY"""
     logging.debug('HOSTS_ALLOW %s' % HOSTS_ALLOW)
     logging.debug('HOSTS_DENY %s' % HOSTS_DENY)
-    # make sure we have a string
+    
     ipaddr = str(ipaddr)
     logging.debug('ipaddr to check %s' % ipaddr)
 
     if ipaddr in HOSTS_ALLOW:
-        # always allowed
         return True
 
     if '*' in HOSTS_DENY:
-        # all denied
         return False
 
     if ipaddr in HOSTS_DENY:
-        # allow all except denied
         return False
 
-    # otherwise
-    # default action
     return True
 
 def _daemonize_me():
-    # daemonize
-    # based on the python recipe at
-    #   http://code.activestate.com/recipes/278731-creating-a-daemon-the-python-way
+    """Daemonize the process"""
     umask = 0
     workingdir = '/'
     maxfd = 1024
@@ -114,107 +96,98 @@ def _daemonize_me():
         raise Exception('%s [%d]' % (e.strerror, e.errno))
 
     if pid == 0:
-        # we are the first child
         os.setsid()
         try:
             pid = os.fork()
         except OSError as e:
             raise Exception('%s [%d]' % (e.strerror, e.errno))
         if pid == 0:
-            # second child
             os.chdir(workingdir)
             os.umask(umask)
         else:
             os._exit(0)
     else:
         os._exit(0)
-    # close all open file descriptors
+    
+    # Close all open file descriptors
     try:
         mfd = os.sysconf('SC_OPEN_MAX')
     except (AttributeError, ValueError):
-        mfd=maxfd
+        mfd = maxfd
     for fd in range(0, mfd):
         try:
             os.close(fd)
         except OSError:
-            pass # ignore as it wasn't open anyway
+            pass
 
-    # redirect stdio
-    os.open(devnull, os.O_RDWR) # stdin
-    os.dup2(0, 1) # stdout
-    os.dup2(0, 2) # stderr
+    # Redirect stdio
+    os.open(devnull, os.O_RDWR)  # stdin
+    os.dup2(0, 1)  # stdout
+    os.dup2(0, 2)  # stderr
 
-
-
-def press_button(button, duration):
-    # button is a gpiozero digital output object
-    # duration in seconds
-    #
-    # time check prevents spamming of the switches
+def reset_device(device_name, duration):
+    """Reset a specific device"""
     global last_action_time
     
-    if button is None:
-        return
+    if device_name not in DEVICES:
+        logging.error(f"Device {device_name} not found")
+        return False
 
+    device = DEVICES[device_name]
     current_time = time.time()
-    if current_time > last_action_time + MIN_INTERVAL:
-        logging.info('%s button pressed for %s seconds at %s',
-                     BUTTON_NAMES[button.pin.number], duration,
-                     time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time)))
-        last_action_time = current_time
-        button.on()
+    
+    # Check timing interval per device
+    if device_name not in last_action_time:
+        last_action_time[device_name] = 0
+    
+    if current_time > last_action_time[device_name] + MIN_INTERVAL:
+        logging.info(f'Resetting device {device_name} for {duration} seconds at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(current_time))}')
+        last_action_time[device_name] = current_time
+        
+        device.reset_control.on()
         time.sleep(duration)
-        button.off()
+        device.reset_control.off()
+        return True
     else:
-        logging.debug('Too soon after last action.')
+        logging.debug(f'Too soon after last action for device {device_name}')
+        return False
 
 def pinger(targets, interval):
-    # thread to ping target system and set result accordingly
+    """Thread to ping target systems and set result accordingly"""
     global PINGABLE
     
-    logging.debug('Ping targets: %s' %targets)
-
-    # create ping object
+    logging.debug('Ping targets: %s' % targets)
+    
     pingthings = {}
     for t in targets:
-        pingthings[t] = gpiozero.PingServer(t)
+        if t.strip():  # Only add non-empty targets
+            pingthings[t] = gpiozero.PingServer(t)
+    
     logging.debug(pingthings)
-    # keep pinging
-    # for an "and" combination of multiple targets
-    while stop_threads == False:
+    
+    while not stop_threads:
         result = '<br>'
         for p in pingthings:
-            result += '&nbsp;&nbsp;&nbsp;&nbsp;%s: %s<br>' % (p,('No','Yes')[pingthings[p].value])
-        ##logging.debug(result)
+            result += '&nbsp;&nbsp;&nbsp;&nbsp;%s: %s<br>' % (p, ('No', 'Yes')[pingthings[p].value])
         PINGABLE = result
         time.sleep(interval)
-    # cleanup
+    
+    # Cleanup
     for p in pingthings:
         pingthings[p].close()
-    logging.debug('Exiting')
-  
+    logging.debug('Pinger exiting')
 
 def webserver(host, port):
-    # simple web server for control page
-    # currently has no security so anyone who finds it can use it
-    #
-    # this is also far from a complete webserver
-    #
-    # yes, I'm aware I could use BaseHTTPServer
-    # but I'm not sure how that copes with globals, threading,
-    # dropping root privs, and non-blocking sockets
-
-    global last_action_time, privs_droppable
+    """Simple web server for device control"""
+    global last_action_time
 
     base_header = 'HTTP/1.0 '
     ok_header = '200 OK\n\n'
-    html_header = '<!DOCTYPE HTML>\n<html><head><title>fakewake</title>\n'
+    html_header = '<!DOCTYPE HTML>\n<html><head><title>FakeWake - Multi Device Control</title>\n'
     clacks_header = '<meta http-equiv="X-Clacks-Overhead" content="GNU Terry Pratchett" />\n'
     refresh_header = '<meta http-equiv="refresh" content="%s;/">' % WEBSERVER_RELOAD_DELAY
     end_header = '</head><body>'
     
-    target_id = '<h1>%s</h1>' % TARGET_IDS[0]
-
     error403 = base_header + ok_header + html_header + clacks_header + end_header
     error403 += '<h2>403 Forbidden</h2></body></html>'
     error404 = base_header + ok_header + html_header + clacks_header + end_header
@@ -222,168 +195,124 @@ def webserver(host, port):
     error405 = base_header + '405 Method Not Allowed\n' + html_header + clacks_header + end_header
     error405 += '<h2>405 Method Not Allowed</h2></body></html>'
     
-    my_controls = '<hr><h2><h1>%s</h2>\
-    <form action="/rebootme" method="get"><input type="submit" value="Reboot"></form><br><br>\
-    <form action="/poweroffme" method="get"><input type="submit" value="Power off"></form>' % os.uname()[1]
-    
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    logging.debug('binding to %s:%s' % (host,port))
-    server_socket.bind((host,port))
+    logging.debug('binding to %s:%s' % (host, port))
+    server_socket.bind((host, port))
     server_socket.listen(5)
     logging.debug('started listening')
     server_socket.setblocking(0)
-    while stop_threads == False:
-        r, w, e = select.select([server_socket],[],[],0)
+    
+    while not stop_threads:
+        r, w, e = select.select([server_socket], [], [], 0)
         for s in r:
             if s == server_socket:
-                # accept socket and handle request
                 client_socket, client_address = server_socket.accept()
-                # validate host
-                if valid_host(client_address[0]) == False:
-                    logging.info('Access attempted from blocked host %s(%s)' % (client_address[0],
-                                                                                socket.gethostbyaddr(client_address[0])[0]))
-                    client_socket.sendall(error403)
+                
+                # Validate host
+                if not valid_host(client_address[0]):
+                    logging.info('Access attempted from blocked host %s' % client_address[0])
+                    client_socket.sendall(error403.encode())
                     client_socket.shutdown(socket.SHUT_RDWR)
-                    client_socket.close
+                    client_socket.close()
                     continue
-                # receive request. This may block
+                
+                # Receive request
                 request = client_socket.recv(1024).decode()
                 logging.info('Connection from ' + client_address[0])
-                logging.debug('Parsing reguest')
-                # parse request
+                logging.debug('Parsing request')
+                
+                # Parse request
                 for line in request.splitlines():
-                    prefix = line.split(' ',1)[0]
-                    if prefix in ('POST', 'HEAD', 'PUT', 'DELETE',
-                                    'OPTIONS', 'CONNECT'):
+                    prefix = line.split(' ', 1)[0]
+                    if prefix in ('POST', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'CONNECT'):
                         logging.debug('Sending Error 405')
                         client_socket.sendall(error405.encode())
                     elif prefix != 'GET':
-                        # don't know and don't care what this is
                         pass
                     else:
-                        # must be a GET request
+                        # GET request
                         method, url, trailer = line.split()
-                        # need this due to form/button hack in html code
                         url = url.split('?')[0]
-                        if url not in ('/', '/power', '/forcepower','/reset','/config', '/log','/rebootme','/poweroffme'):
+                        
+                        # Check for device reset URLs
+                        device_reset_urls = [f'/reset_{name}' for name in DEVICES.keys()]
+                        valid_urls = ['/', '/config', '/log'] + device_reset_urls
+                        
+                        if url not in valid_urls:
                             client_socket.sendall(error404.encode())
-##                        elif url in ('/rebootme','/poweroffme') and LOCAL_PWR_CTRL == False:
-##                            client_socket.sendall(error404.encode())
                         elif url == '/log':
-                            # show log file
+                            # Show log file
                             logging.debug('Sending log file(%s)' % log_file)
                             reply = base_header + ok_header
                             try:
-                                lf = open(log_file, 'r')
-                                reply += lf.read()
-                                lf.close()
-                            except KeyboardInterrupt:
-                                raise
+                                with open(log_file, 'r') as lf:
+                                    reply += lf.read()
                             except IOError as e:
                                 reply += str(e)
                             client_socket.sendall(reply.encode())
                         elif url == '/config':
-                            # show config
+                            # Show config
                             reply = base_header + ok_header
                             current_config = io.StringIO()
                             config.write(current_config)
                             reply += current_config.getvalue()
                             current_config.close()
-                            # send replycfg
                             logging.debug('Sending config')
                             client_socket.sendall(reply.encode())
                         elif url == '/':
-                            # assemble page
-                            if time.time() > last_action_time + MIN_INTERVAL:
-                                button_state = ''
-                            else:
-                                button_state = 'disabled'
-                            reply = base_header + ok_header + html_header + clacks_header + refresh_header + end_header + target_id
-                            reply += '<b>PSU State:</b> '
-                            if PSU_SENSE_ENABLED:
-                                if PSU_SENSE.is_active:
-                                    reply += 'On'
+                            # Main page with all devices
+                            reply = base_header + ok_header + html_header + clacks_header + refresh_header + end_header
+                            reply += '<h1>FakeWake - Multi Device Control</h1>'
+                            reply += '<b>Pingable:</b> %s<br><hr>' % PINGABLE
+                            
+                            # Add controls for each device
+                            for device_name, device in DEVICES.items():
+                                current_time = time.time()
+                                device_last_action = last_action_time.get(device_name, 0)
+                                
+                                if current_time > device_last_action + MIN_INTERVAL:
+                                    button_state = ''
                                 else:
-                                    reply += 'Off/Standby'
-                            else:
-                                reply += 'Unknown'
-                            reply += '<br><b>Pingable:</b> %s' % PINGABLE
-                            if POWER_ENABLED:
-                                reply += '<br><form action="/power" method="get">'
-                                reply += '<input type="submit" value="Power On/Off" %s></form><br>' % button_state
-                                reply += '<form action="/forcepower" method="get">'
-                                reply += '<input type="submit" value="Force Power Off" %s></form><br>' % button_state
-                            if RESET_ENABLED:
-                                reply += '<form action="/reset" method="get">'
-                                reply += '<input type="submit" value="Reset" %s></form><br>' % button_state
-                            if AUX1_ENABLED:
-                                reply += '<form action="/aux1" method="get">'
-                                reply += '<input type="submit" value="Aux 1" %s></form><br>' % button_state
-                            if AUX2_ENABLED:
-                                reply += '<form action="/aux2" method="get">'
-                                reply += '<input type="submit" value="Aux 2" %s></form><br>' % button_state
-                            if LOCAL_PWR_CTRL:
-                                reply += my_controls
+                                    button_state = 'disabled'
+                                
+                                reply += f'<h3>Device: {device_name}</h3>'
+                                reply += f'<p>GPIO Pin: {device.reset_gpio}</p>'
+                                reply += f'<form action="/reset_{device_name}" method="get">'
+                                reply += f'<input type="submit" value="Reset {device_name}" {button_state}></form><br>'
+                            
                             reply += '</body></html>'
-                            # send reply
                             client_socket.sendall(reply.encode())
-                        else:
-                            # send reply
-                            # this is the same for all actions
-                            reply = base_header + ok_header + html_header + clacks_header + refresh_header
-                            reply += 'Working. Please wait...'
-                            reply += '<center><form action="/" method="get">'
-                            reply += '<input type="submit" value="Continue">'
-                            reply += '</form></center></body></html>'
-##                            client_socket.sendall(reply.encode())
-                            # do action
-                            if url == '/power' and POWER_ENABLED:
+                        elif url.startswith('/reset_'):
+                            # Device reset action
+                            device_name = url[7:]  # Remove '/reset_' prefix
+                            if device_name in DEVICES:
+                                reply = base_header + ok_header + html_header + clacks_header + refresh_header
+                                reply += f'<p>Resetting {device_name}. Please wait...</p>'
+                                reply += '<center><form action="/" method="get">'
+                                reply += '<input type="submit" value="Continue">'
+                                reply += '</form></center></body></html>'
                                 client_socket.sendall(reply.encode())
-                                logging.debug('Pushing Power Button')
-                                press_button(POWER_SWITCH, SHORT_PRESS)
-                            if url =='/forcepower' and POWER_ENABLED and PSU_SENSE.is_active:
-                                client_socket.sendall(reply.encode())
-                                logging.debug('Long Push on Power Button')
-                                press_button(POWER_SWITCH, LONG_PRESS)
-                            if url =='/reset' and RESET_ENABLED and PSU_SENSE.is_active:
-                                client_socket.sendall(reply.encode())
-                                logging.debug('Pushing Reset Button')
-                                press_button(RESET_SWITCH, SHORT_PRESS)
-                            if url =='/aux1' and AUX1_ENABLED:
-                                client_socket.sendall(reply.encode())
-                                logging.debug('Firing aux1')
-                                press_button(AUX1, SHORT_PRESS)
-                            if url =='/aux2' and AUX2_ENABLED:
-                                client_socket.sendall(reply.encode())
-                                logging.debug('Firing aux2')
-                                press_button(AUX2, SHORT_PRESS)
-                            if url == '/rebootme':
-                                if LOCAL_PWR_CTRL == True:
-                                    client_socket.sendall(reply.encode())
-                                    logging.debug('Attempting to reboot myself')
-                                    output = subprocess.run(['sudo', '-n','reboot'],capture_output=True)
-                                else:
-                                    client_socket.sendall(error404.encode())
-                                if output.returncode != 0:
-                                    logging.warning('Attemped reboot failed with error: "%s"' % output.stderr.decode())
-                            if url == '/poweroffme' and LOCAL_PWR_CTRL == True:
-                                logging.debug('Attempting to power off myself')
-                                output = subprocess.run(['sudo', '-n','poweroff'],capture_output=True)
-                                if output.returncode != 0:
-                                    logging.warning('Attemped power off failed with error: "%s"' % output.stderr.decode())
+                                
+                                logging.debug(f'Resetting device {device_name}')
+                                reset_device(device_name, SHORT_PRESS)
+                            else:
+                                client_socket.sendall(error404.encode())
+                
                 client_socket.close()
-                reply = None
-        # reduce cpu load
+        
+        # Reduce CPU load
         time.sleep(0.1)
+    
     server_socket.close()
-    logging.debug('exiting')
+    logging.debug('Webserver exiting')
 
 def start_pinger():
+    """Start the pinger thread"""
     global PINGABLE
     PINGABLE = 'Unknown'
-    if PINGER_ENABLED:
-        logging.debug('(re)starting Pinger')
+    if PINGER_ENABLED and TARGET_IDS and any(t.strip() for t in TARGET_IDS):
+        logging.debug('Starting Pinger')
         ping_thread = threading.Thread(name='pinger',
                                        target=pinger,
                                        args=(TARGET_IDS, PING_INTERVAL))
@@ -393,367 +322,287 @@ def start_pinger():
     return ping_thread
 
 def start_webserver():
-##    global privs_droppable
+    """Start the webserver thread"""
     if WEBSERVER_ENABLED:
-        logging.debug('(re)starting Webserver')
+        logging.debug('Starting Webserver')
         webserver_thread = threading.Thread(name='webserver',
                                             target=webserver,
-                                            args=(WEBSERVER_HOST,WEBSERVER_PORT))
+                                            args=(WEBSERVER_HOST, WEBSERVER_PORT))
         webserver_thread.start()
     else:
         webserver_thread = None
     return webserver_thread
 
-
-
-## now we can do something...
+## Main execution
 if __name__ == '__main__':
-
-    # globals
-    #   default config
-    #   fed to config parser
-    default_config = {'power':'23',
-                      'reset':'24',
-                      'psu_sense':'25',
-                      'short':'0.1',
-                      'long':'5.0',
-                      'min_interval':'180',
-                      'web_enabled':True,
-                      'host':'',
-                      'web_port':'8080',
-                      'reload_delay':'15',
-                      'wol_enabled':False,
-                      'wol_ports':'7, 9, 7491',
-                      'wake_mac':'',
-                      'shutdown_mac':'',
-                      'reset_mac':'',
-                      'forceoff_mac':'',
-                      'ping_enabled':True,
-                      'target':'',
-                      'interval':'1',
-                      'restart':True,
-                      'aux1':'0',
-                      'aux2':'0',
-                      'aux1_mac':'',
-                      'aux2_mac':'',
-                      'hosts_allow':'',
-                      'hosts_deny':'',
-                      'psu_sense_active_low':False,
-                      'drop_privs':True,
-                      'user':'nobody',}
-    # pinger
+    
+    # Default config
+    default_config = {
+        'short': '0.5',
+        'min_interval': '30',
+        'web_enabled': 'True',
+        'host': '',
+        'web_port': '8080',
+        'reload_delay': '15',
+        'ping_enabled': 'True',
+        'target': '',
+        'interval': '1',
+        'restart': 'True',
+        'hosts_allow': '',
+        'hosts_deny': '',
+        'drop_privs': 'True',
+        'user': 'nobody',
+        # Device configuration - example format
+        'device1_name': 'Jetson1',
+        'device1_gpio': '24',
+        'device2_name': 'Jetson2', 
+        'device2_gpio': '25',
+    }
+    
+    # Global variables
     PINGABLE = 'Unknown'
-
-    # cmd line arguments
-    #   need to do this here as it may affect logging config
-    #   and whether we should continue to run in the foreground
-    cmd_parser = argparse.ArgumentParser(description='Wake on LAN daemon. Controls power on/off for a PC connected to gpio.',
-                                         epilog='If -c is not specified the internal defaults will be used')
-    cmd_parser.add_argument('--debug', help='enabled debug output to logfile',
+    
+    # Command line arguments
+    cmd_parser = argparse.ArgumentParser(
+        description='Multi-device reset control daemon via GPIO.',
+        epilog='If -c is not specified, internal defaults will be used'
+    )
+    cmd_parser.add_argument('--debug', help='Enable debug output to logfile',
                             action='store_true', default=False)
-    cmd_parser.add_argument('-c','--config', help='load config from specified file.',
+    cmd_parser.add_argument('-c', '--config', help='Load config from specified file.',
                             default='')
-    cmd_parser.add_argument('-N','--nodaemon',
-                            help='do not daemonise. Run in foreground instead.',
-                            action = 'store_true',
-                            default=False)
+    cmd_parser.add_argument('-N', '--nodaemon',
+                            help='Do not daemonize. Run in foreground instead.',
+                            action='store_true', default=False)
     cmd_args = cmd_parser.parse_args()
-    #  preprocess config file name if present
-    if cmd_args.config != '':
+    
+    if cmd_args.config:
         cmd_args.config = os.path.abspath(cmd_args.config)
-
-    # daemonise
-    if cmd_args.nodaemon == False:
+    
+    # Daemonize
+    if not cmd_args.nodaemon:
         _daemonize_me()
     
-    # set up logging
+    # Set up logging
     log_file = '/tmp/fakewake.log'
     log_format = '%(asctime)s:%(levelname)s:%(threadName)s:%(message)s'
     log_filemode = 'w'
-    #   manage log files
+    
+    # Manage log files
     try:
-        os.rename(log_file +'2', log_file +'3')
+        os.rename(log_file + '2', log_file + '3')
     except OSError:
         pass
     try:
-        os.rename(log_file, log_file +'2')
+        os.rename(log_file, log_file + '2')
     except OSError:
         pass
-    #   base logger
-    if cmd_args.debug:
-        log_level = logging.DEBUG
-    else:
-        log_level = logging.INFO
+    
+    # Base logger
+    log_level = logging.DEBUG if cmd_args.debug else logging.INFO
     logging.basicConfig(level=log_level,
                         filename=log_file, filemode=log_filemode,
                         format=log_format)
-    #   set permissions on log file
+    
+    # Set permissions on log file
     try:
         os.chmod(log_file, 0o666)
     except OSError:
         pass
-    #   log errors and warnings to stderr
+    
+    # Log errors and warnings to stderr
     stderr_logger = logging.StreamHandler(sys.stderr)
     stderr_formatter = logging.Formatter('fakewake:%(levelname)s:%(message)s')
     stderr_logger.setLevel(logging.WARNING)
     stderr_logger.setFormatter(stderr_formatter)
     logging.getLogger('').addHandler(stderr_logger)
-    #   uncomment to enable logging to console
+    
+    # Console logger (uncomment for console output)
     console_logger = logging.StreamHandler()
     console_formatter = logging.Formatter(log_format)
     console_logger.setFormatter(console_formatter)
     logging.getLogger('').addHandler(console_logger)
-
-    #   just in case there's a running tail -f on the log file
-    #   it's a hack, I know.
-    logging.info('\x1b[2J\x1b[H')
-
-    #   log pid
+    
+    logging.info('\x1b[2J\x1b[H')  # Clear screen hack
     logging.info('My pid: %s' % os.getpid())
-    # read config
-    logging.debug('reading config file')
-    # this is probably abusing the defaults mechanism...
-    config = configparser.ConfigParser(default_config)
+    
+    # Read config
+    logging.debug('Reading config file')
+    config = configparser.ConfigParser()
+    
+    # Set defaults
+    config.read_dict({'DEFAULT': default_config})
+    
     try:
-        t = config.read(cmd_args.config)
+        if cmd_args.config:
+            config.read(cmd_args.config)
     except configparser.Error as e:
-        # error when parsing config file
-        msg = 'Error parsing config file %s: %s' % (cmd_args.config, str(e))
+        msg = f'Error parsing config file {cmd_args.config}: {str(e)}'
         logging.critical(msg)
-        logging.critical('Exiting.')
         sys.exit(msg)
-    if len(t) == 0 and cmd_args.config != '':
-        # couldn't open config file
-        msg = 'Unable to open config file ' + cmd_args.config
-        logging.critical(msg)
-        logging.critical('Exiting.')
-        sys.exit(msg)
-        
+    
+    # Parse configuration
     try:
-        POWER_PIN = config.getint('pins', 'power')
-        RESET_PIN = config.getint('pins','reset')
-        PSU_SENSE_PIN = config.getint('pins', 'psu_sense')
-        PSU_SENSE_ACTIVE_LOW = config.getboolean('pins', 'psu_sense_active_low')
-        AUX1_PIN = config.getint('pins', 'aux1')
-        AUX2_PIN = config.getint('pins', 'aux2')
-    except configparser.NoSectionError:
-        logging.debug('No config section "%s" using defaults instead.' % 'pins')
-        POWER_PIN = int(default_config['power'])
-        RESET_PIN = int(default_config['reset'])
-        PSU_SENSE_PIN = int(default_config['psu_sense'])
-        PSU_SENSE_ACTIVE_LOW = default_config['psu_sense_active_low']
-        AUX1_PIN = int(default_config['aux1'])
-        AUX2_PIN = int(default_config['aux2'])
-    try:
-        SHORT_PRESS = config.getfloat('timings', 'short')
-        LONG_PRESS = config.getfloat('timings', 'long')
-        MIN_INTERVAL = config.getfloat('timings','min_interval')
-    except configparser.NoSectionError:
-        logging.debug('No config section "%s" using defaults instead.' % 'timings')
+        SHORT_PRESS = config.getfloat('DEFAULT', 'short')
+        MIN_INTERVAL = config.getfloat('DEFAULT', 'min_interval')
+    except (configparser.NoSectionError, ValueError) as e:
+        logging.error(f"Error reading timing config: {e}")
         SHORT_PRESS = float(default_config['short'])
-        LONG_PRESS = float(default_config['long'])
         MIN_INTERVAL = float(default_config['min_interval'])
-    try:
-        WEBSERVER_ENABLED = config.getboolean('webserver','web_enabled')
-        WEBSERVER_HOST = config.get('webserver','host')
-        WEBSERVER_PORT = config.getint('webserver', 'web_port')
-        WEBSERVER_RELOAD_DELAY = config.get('webserver','reload_delay')
-    except configparser.NoSectionError:
-        logging.debug('No config section "%s" using defaults instead.' % 'webserver')
-        WEBSERVER_ENABLED = bool(default_config['web_enabled'])
-        WEBSERVER_HOST = default_config['host']
-        WEBSERVER_PORT = int(default_config['web_port'])
-        WEBSERVER_RELOAD_DELAY = default_config['reload_delay']
-    try:
-        PINGER_ENABLED = config.getboolean('pinger', 'pinger_enabled')
-        TARGET_IDS = config.get('pinger', 'target').strip().split(',')
-        PING_INTERVAL = config.getfloat('pinger', 'interval')
-    except configparser.NoSectionError:
-        logging.debug('No config section "%s" using defaults instead.' % 'pinger')
-        PINGER_ENABLED = bool(default_config['pinger_enabled'])
-        TARGET_IDS = default_config['target'].strip().split(',')
-        if TARGET_IDS is None or len(TARGET_IDS) == 0:
-            PINGER_ENABLED = False
-        PING_INTERVAL = float(default_config['interval'])
-    try:
-        RESTART_THREADS = config.getboolean('threads', 'restart')
-    except configparser.NoSectionError:
-        logging.debug('No config section "%s" using defaults instead.' % 'threads')
-        RESTART_THREADS = bool(default_config['restart'])
-    try:
-        RAW_HOSTS_ALLOW = config.get('security','hosts_allow')
-        RAW_HOSTS_DENY = config.get('security','hosts_deny')
-        DROP_PRIVS = config.getboolean('security','drop_privs')
-        PRIVS_NAME = config.get('security','user')
-    except configparser.NoSectionError:
-        logging.debug('No config section "%s" using defaults instead.' % 'security')
-        RAW_HOSTS_ALLOW = default_config['hosts_allow']
-        RAW_HOSTS_DENY = default_config['hosts_deny']
-        DROP_PRIVS = bool(default_config['drop_privs'])
-        PRIVS_NAME = default_config['user']
-    PRIVS_GROUP = grp.getgrgid(pwd.getpwnam(PRIVS_NAME)[3])[0]
-    
-    # parse RAW host lists
-    HOSTS_ALLOW = []
-    for t in RAW_HOSTS_ALLOW.split(','):
-        t.strip
-        HOSTS_ALLOW.append(t)
-    HOSTS_DENY = []
-    for t in RAW_HOSTS_DENY.split(','):
-        t.strip
-        HOSTS_DENY.append(t)
-
-    #  enable/disable flags
-    POWER_ENABLED = bool(POWER_PIN)
-    RESET_ENABLED = bool(RESET_PIN)
-    PSU_SENSE_ENABLED = bool(PSU_SENSE_PIN)
-    AUX1_ENABLED = bool(AUX1_PIN)
-    AUX2_ENABLED = bool(AUX2_PIN)
-    if not PSU_SENSE_ENABLED:
-        # without knowing the PSU state WOL is unpredictable
-        # so disable it
-        logging.warning('No pin specified for PSU_SENSE. WOL support disabled')
-        WOL_ENABLED = False
-
-    #  button names
-    BUTTON_NAMES = {POWER_PIN: 'Power', RESET_PIN: 'Reset', AUX1_PIN:'AUX1', AUX2_PIN:'AUX2'}
     
     try:
-        # create gpio objects
-        logging.debug('Creating gpiozero objects')
-        if POWER_ENABLED:
-            logging.debug('  Power switch')
-            POWER_SWITCH = gpiozero.DigitalOutputDevice(POWER_PIN,active_high=True,
-                                                        initial_value=False)
-
-        if RESET_ENABLED:
-            logging.debug('  Reset switch')
-            RESET_SWITCH = gpiozero.DigitalOutputDevice(RESET_PIN,active_high=True,
-                                                        initial_value=False)
-
-        if PSU_SENSE_ENABLED:
-            logging.debug('  PSU sense')
-            PSU_SENSE = gpiozero.DigitalInputDevice(PSU_SENSE_PIN,
-                                                    pull_up=PSU_SENSE_ACTIVE_LOW)
-
-        if AUX1_ENABLED:
-            logging.debug('  aux 1')
-            AUX1 = gpiozero.DigitalOutputDevice(AUX1_PIN,active_high=True,
-                                                        initial_value=False)
-        if AUX2_ENABLED:
-            logging.debug('  aux 2')
-            AUX2 = gpiozero.DigitalOutputDevice(AUX2_PIN,active_high=True,
-                                                        initial_value=False)
-
-        # initalise timer
-        last_action_time = time.time() - MIN_INTERVAL
-
-        # start threads
-        stop_threads = False
-        #   pinger
-        ping_thread = start_pinger()
-        #   webserver
-        webserver_thread = start_webserver()
-        #   wol
-        wol_thread = start_wol()
-        
-        # drop root privilages
-        privs_dropped = False
-        logging.debug('drop_privs: %s' % DROP_PRIVS)
-        if DROP_PRIVS:
-            logging.debug('attempting to drop root privilages')
-            target_uid = pwd.getpwnam(PRIVS_NAME)[2]
-            target_gid = grp.getgrnam(PRIVS_GROUP)[2]
-            current_uid = os.getuid()
-            current_uname = pwd.getpwuid(current_uid)[0]
-            current_gid = os.getgid()
-            current_gname = grp.getgrgid(current_gid)[0]
-            if current_uid == 0:
-                # root
-                logging.debug('Running as root. Attempting to drop privileges')
-                drop_failed = False
-                # log file
-                try:
-                    os.chown(log_file, target_uid, target_gid)
-                except OSError:
-                    logging.debug('Unabled to change ownership of log file to %s:%s', PRIVS_NAME, PRIVS_GROUP)
-                # group ID
-                try:
-                    os.setgid(target_gid)
-                except OSError as e:
-                    drop_failed = True
-                    logging.debug('Unabled to set gid to %s %s' % (PRIVS_GROUP, e))
-                # user ID
-                try:
-                    os.setuid(target_uid)
-                except OSError as e:
-                    drop_failed = True
-                    logging.debug('Unabled to set uid to %s %s' % (PRIVS_NAME, e))
-                # umask
-                try:
-                    os.umask(0o77)
-                except OSError as e:
-                    drop_failed = True
-                    logging.debug('Unabled to set umask to 077 %s' % (PRIVS_NAME, e))
-                # update logs
-                if drop_failed:
-                    logging.warning('Failed to drop root priviliges.')
-                else:
-                    logging.debug('Success. Now running as %s:%s' % (PRIVS_NAME, PRIVS_GROUP))
-                    privs_dropped = True
-            else:
-                # not root
-                logging.debug('Currently running as user %s:%s. No need to drop privileges'
-                              % (current_uname, current_gname))
-                                  
-        # determine if we're be able to control local OS power state
-        if subprocess.run(['sudo', '-n', 'reboot', '-w'], capture_output=True).returncode == 0 and \
-            subprocess.run(['sudo', '-n', 'poweroff', '-w'], capture_output=True).returncode == 0:
-            LOCAL_PWR_CTRL = True
-        else:
-            LOCAL_PWR_CTRL = False
-        logging.debug('Local power control: %s' % LOCAL_PWR_CTRL)
-        
-        loop_delay = 0.5
-        logging.debug('entering main loop')
+        WEBSERVER_ENABLED = config.getboolean('DEFAULT', 'web_enabled')
+        WEBSERVER_HOST = config.get('DEFAULT', 'host')
+        WEBSERVER_PORT = config.getint('DEFAULT', 'web_port')
+        WEBSERVER_RELOAD_DELAY = config.get('DEFAULT', 'reload_delay')
+    except (configparser.NoSectionError, ValueError) as e:
+        logging.error(f"Error reading webserver config: {e}")
+        WEBSERVER_ENABLED = True
+        WEBSERVER_HOST = ''
+        WEBSERVER_PORT = 8080
+        WEBSERVER_RELOAD_DELAY = '15'
+    
+    try:
+        PINGER_ENABLED = config.getboolean('DEFAULT', 'ping_enabled')
+        TARGET_IDS = [t.strip() for t in config.get('DEFAULT', 'target').split(',') if t.strip()]
+        PING_INTERVAL = config.getfloat('DEFAULT', 'interval')
+    except (configparser.NoSectionError, ValueError) as e:
+        logging.error(f"Error reading pinger config: {e}")
+        PINGER_ENABLED = False
+        TARGET_IDS = []
+        PING_INTERVAL = 1.0
+    
+    try:
+        RESTART_THREADS = config.getboolean('DEFAULT', 'restart')
+        DROP_PRIVS = config.getboolean('DEFAULT', 'drop_privs')
+        PRIVS_NAME = config.get('DEFAULT', 'user')
+    except (configparser.NoSectionError, ValueError) as e:
+        logging.error(f"Error reading security config: {e}")
+        RESTART_THREADS = True
+        DROP_PRIVS = True
+        PRIVS_NAME = 'nobody'
+    
+    try:
+        RAW_HOSTS_ALLOW = config.get('DEFAULT', 'hosts_allow')
+        RAW_HOSTS_DENY = config.get('DEFAULT', 'hosts_deny')
+    except configparser.NoSectionError as e:
+        logging.error(f"Error reading hosts config: {e}")
+        RAW_HOSTS_ALLOW = ''
+        RAW_HOSTS_DENY = ''
+    
+        # Parse host lists
+        HOSTS_ALLOW = [t.strip() for t in RAW_HOSTS_ALLOW.split(',') if t.strip()]
+        HOSTS_DENY = [t.strip() for t in RAW_HOSTS_DENY.split(',') if t.strip()]
+    
+        # Initialize devices from config
+        logging.debug('Initializing devices')
+        device_count = 1
         while True:
-            # check for dead threads and restart
-            # webserver and wol threads will not restart when using ports < 1024
-            # once privileges have been dropped
-            if ping_thread is not None and ping_thread.isAlive() == False:
+            name_key = f'device{device_count}_name'
+            gpio_key = f'device{device_count}_gpio'
+            
+            try:
+                device_name = config.get('DEFAULT', name_key)
+                device_gpio = config.getint('DEFAULT', gpio_key)
+                
+                logging.info(f'Adding device: {device_name} on GPIO {device_gpio}')
+                DEVICES[device_name] = JetsonDevice(device_name, device_gpio)
+                device_count += 1
+            except (configparser.NoOptionError, ValueError):
+                break
+        
+        if not DEVICES:
+            msg = "No devices configured. Please check your configuration."
+            logging.critical(msg)
+            sys.exit(msg)
+        
+        logging.info(f'Initialized {len(DEVICES)} devices: {list(DEVICES.keys())}')
+    
+    try:
+        # Initialize timing
+        last_action_time = {}
+        for device_name in DEVICES.keys():
+            last_action_time[device_name] = time.time() - MIN_INTERVAL
+        
+        # Start threads
+        stop_threads = False
+        ping_thread = start_pinger()
+        webserver_thread = start_webserver()
+        
+        # Determine local power control capability
+        try:
+            reboot_check = subprocess.run(['sudo', '-n', 'reboot', '-w'], 
+                                        capture_output=True, text=True, timeout=5)
+            poweroff_check = subprocess.run(['sudo', '-n', 'poweroff', '-w'], 
+                                          capture_output=True, text=True, timeout=5)
+            LOCAL_PWR_CTRL = (reboot_check.returncode == 0 and poweroff_check.returncode == 0)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            LOCAL_PWR_CTRL = False
+        
+        logging.debug('Local power control: %s' % LOCAL_PWR_CTRL)
+            logging.debug('Attempting to drop root privileges')
+            try:
+                PRIVS_GROUP = grp.getgrgid(pwd.getpwnam(PRIVS_NAME)[3])[0]
+                target_uid = pwd.getpwnam(PRIVS_NAME)[2]
+                target_gid = grp.getgrnam(PRIVS_GROUP)[2]
+                current_uid = os.getuid()
+                
+                if current_uid == 0:
+                    logging.debug('Running as root. Attempting to drop privileges')
+                    try:
+                        os.chown(log_file, target_uid, target_gid)
+                    except OSError:
+                        logging.debug(f'Unable to change ownership of log file to {PRIVS_NAME}:{PRIVS_GROUP}')
+                    
+                    os.setgid(target_gid)
+                    os.setuid(target_uid)
+                    os.umask(0o77)
+                    logging.debug(f'Success. Now running as {PRIVS_NAME}:{PRIVS_GROUP}')
+                else:
+                    current_uname = pwd.getpwuid(current_uid)[0]
+                    current_gid = os.getgid()
+                    current_gname = grp.getgrgid(current_gid)[0]
+                    logging.debug(f'Currently running as user {current_uname}:{current_gname}. No need to drop privileges')
+            except Exception as e:
+                logging.warning(f'Failed to drop root privileges: {e}')
+        
+        # Drop root privileges
+        if DROP_PRIVS:
+        loop_delay = 0.5
+        logging.debug('Entering main loop')
+        
+        while True:
+            # Check for dead threads and restart
+            if ping_thread is not None and not ping_thread.is_alive():
                 if RESTART_THREADS:
                     ping_thread = start_pinger()
                 else:
                     logging.warning('Pinger thread has died.')
                     PINGABLE = 'Unknown'
-            if webserver_thread is not None and webserver_thread.isAlive() == False:
+            
+            if webserver_thread is not None and not webserver_thread.is_alive():
                 if RESTART_THREADS:
                     webserver_thread = start_webserver()
                 else:
                     logging.critical('Webserver thread has died. Exiting')
                     break
-            time.sleep(loop_delay)
             
+            time.sleep(loop_delay)
+    
+    except KeyboardInterrupt:
+        logging.info('Received interrupt signal')
+    
     finally:
-        # cleanup code
-        logging.debug('cleaning up')
-        logging.debug('stopping threads')
+        # Cleanup
+        logging.debug('Cleaning up')
+        logging.debug('Stopping threads')
         stop_threads = True
+        
         logging.debug('Freeing GPIO')
-        try:
-            POWER_SWITCH.close()
-        except:
-            pass
-        try:
-            RESET_SWITCH.close()
-        except:
-            pass
-        try:
-            AUX1.close()
-        except:
-            pass
-        try:
-            AUX2.close()
-        except:
-            pass
-
+        for device in DEVICES.values():
+            try:
+                device.cleanup()
+            except Exception as e:
+                logging.error(f'Error cleaning up device {device.name}: {e}')
+        
+        logging.info('Shutdown complete')
