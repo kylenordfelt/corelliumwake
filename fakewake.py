@@ -254,7 +254,7 @@ class JetsonResetController:
                 <!DOCTYPE html>
                 <html>
                 <head>
-                    <title>Jetson Reset Controller</title>
+                    <title>Corellium Reset Controller</title>
                     <style>
                         body { font-family: Arial, sans-serif; margin: 40px; }
                         .jetson-card { 
@@ -290,14 +290,14 @@ class JetsonResetController:
                     </style>
                 </head>
                 <body>
-                    <h1>Jetson Reset Controller</h1>
+                    <h1>Corellium Reset Controller</h1>
                     <div class="nav">
                         <a href="/">Home</a>
                         <a href="/status">Status</a>
                         <a href="/config">Config</a>
                     </div>
                     
-                    <button class="reset-all-btn" onclick="resetAll()">Reset All Jetsons</button>
+                    <button class="reset-all-btn" onclick="resetAll()">Reset All Corelliums</button>
                     
                     <h2>Individual Controls</h2>
                 """
